@@ -5,7 +5,7 @@ import { createServer as createViteServer } from 'vite';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { createClient } from '@supabase/supabase-js';
-import { HistoryEntry, TableData } from './types';
+import { HistoryEntry, TableData } from './src/types';
 
 const app = express();
 const server = createServer(app);
@@ -257,30 +257,55 @@ app.post('/api/auth/supabase-login', async (req, res) => {
 
 // MVola Payment Logic
 const MVOLA_CONFIG = {
-  clientId: process.env.MVOLA_CLIENT_ID,
-  clientSecret: process.env.MVOLA_CLIENT_SECRET,
-  merchantNumber: process.env.MVOLA_MERCHANT_NUMBER,
-  env: process.env.MVOLA_ENVIRONMENT || 'sandbox',
-  callbackUrl: process.env.MVOLA_CALLBACK_URL,
+  clientId: process.env.MVOLA_CLIENT_ID?.trim(),
+  clientSecret: process.env.MVOLA_CLIENT_SECRET?.trim(),
+  merchantNumber: process.env.MVOLA_MERCHANT_NUMBER?.trim().replace('+', ''),
+  env: process.env.MVOLA_ENVIRONMENT?.trim() || 'sandbox',
+  callbackUrl: process.env.MVOLA_CALLBACK_URL?.trim(),
 };
 
 async function getMVolaToken() {
+  console.log('MVola Config Env:', MVOLA_CONFIG.env);
+  
+  // Sécurité : Vérifier si on utilise les clés de test en production
+  if (MVOLA_CONFIG.env === 'production' && MVOLA_CONFIG.clientId === 'QmwjHpgEEvDpgMs82Wd4LEPoqYUa') {
+    throw new Error("ALERTE : Vous utilisez un Client ID de TEST (Sandbox) alors que vous êtes en mode 'production'. Veuillez remplacer vos clés dans les Secrets par vos identifiants de production réels.");
+  }
+
   const url = MVOLA_CONFIG.env === 'production' 
     ? 'https://api.mvola.mg/token' 
-    : 'https://sandbox.mvola.mg/token';
+    : 'https://devapi.mvola.mg/token';
+  
+  if (!MVOLA_CONFIG.clientId || !MVOLA_CONFIG.clientSecret) {
+    throw new Error('MVola Client ID or Secret is missing in environment variables');
+  }
   
   const auth = Buffer.from(`${MVOLA_CONFIG.clientId}:${MVOLA_CONFIG.clientSecret}`).toString('base64');
+  
+  const params = new URLSearchParams();
+  params.append('grant_type', 'client_credentials');
+  params.append('scope', 'EXT_INT_MVOLA_SCOPE');
   
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Authorization': `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded'
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Cache-Control': 'no-cache'
     },
-    body: 'grant_type=client_credentials&scope=EXT_INT_MVOLA_SCOPE'
+    body: params.toString()
   });
   
-  if (!response.ok) throw new Error('Failed to get MVola token');
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error('MVola Token Error:', response.status, errorBody);
+    
+    if (response.status === 401) {
+      throw new Error(`Erreur d'authentification MVola (401): Vos identifiants Client ID/Secret sont invalides pour l'environnement '${MVOLA_CONFIG.env}'. Vérifiez vos Secrets.`);
+    }
+    
+    throw new Error(`Failed to get MVola token: ${response.status} ${errorBody}`);
+  }
   const data = await response.json();
   return data.access_token;
 }
@@ -299,40 +324,52 @@ app.post('/api/payment/mvola/initiate', async (req, res) => {
     if (!phoneNumber) return res.status(400).json({ error: 'Numéro de téléphone requis' });
 
     const mvolaToken = await getMVolaToken();
-    const url = MVOLA_CONFIG.env === 'production'
-      ? 'https://api.mvola.mg/mvola/mm/transactions/type/v1/merchantPay'
-      : 'https://sandbox.mvola.mg/mvola/mm/transactions/type/v1/merchantPay';
+    const baseUrl = MVOLA_CONFIG.env === 'production'
+      ? 'https://api.mvola.mg'
+      : 'https://devapi.mvola.mg';
+    
+    const url = `${baseUrl}/mvola/mm/transactions/type/merchantpay/1.0.0/`;
 
     const correlationId = Date.now().toString();
     const prices = await getSubscriptionPrices();
     const amount = user.account_type === 'team' ? prices.team : prices.personal;
+
+    // Format date as per documentation: yyyy-MM-dd'T'HH:mm:ss.SSSZ
+    const requestDate = new Date().toISOString();
 
     const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${mvolaToken}`,
         'Version': '1.0',
-        'X-Correlation-ID': correlationId,
+        'X-CorrelationID': correlationId,
         'UserLanguage': 'FR',
-        'UserIp': '127.0.0.1',
+        'UserAccountIdentifier': `msisdn;${MVOLA_CONFIG.merchantNumber}`,
+        'partnerName': user.company_name || 'MCO',
         'X-Callback-URL': MVOLA_CONFIG.callbackUrl || '',
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache'
       },
       body: JSON.stringify({
-        amount: amount,
+        amount: amount.toString(),
         currency: 'Ar',
         descriptionText: `Abonnement 1 mois - ${user.email}`,
-        requestDate: new Date().toISOString(),
-        transactionReference: `SUB-${user.id}-${Date.now()}`,
-        receiveParty: [{ key: 'msisdn', value: MVOLA_CONFIG.merchantNumber }],
+        requestDate: requestDate,
         requestingOrganisationTransactionReference: `REQ-${user.id}-${Date.now()}`,
-        sendParty: [{ key: 'msisdn', value: phoneNumber.replace(/\s/g, '') }],
-        metadata: [{ key: 'userId', value: user.id }]
+        debitParty: [{ key: 'msisdn', value: phoneNumber.replace(/\s/g, '') }],
+        creditParty: [{ key: 'msisdn', value: MVOLA_CONFIG.merchantNumber }],
+        metadata: [
+          { key: 'userId', value: user.id },
+          { key: 'partnerName', value: user.company_name || 'MCO' }
+        ]
       })
     });
 
-    if (!response.ok) throw new Error('Erreur lors de l\'initiation du paiement MVola');
+    if (!response.ok) {
+      const errorData = await response.text();
+      console.error('MVola Initiation Error:', response.status, errorData);
+      throw new Error(`Erreur lors de l'initiation du paiement MVola: ${response.status}`);
+    }
 
     const data = await response.json();
     res.json({ 
